@@ -1,0 +1,667 @@
+/*
+ * =====================================================================================
+ * ESP32-S3 (N16R8) FACTORY PRODUCTION COUNTER FIRMWARE  (Hardened / Production Build v11)
+ * Target        : ESP32-S3, Arduino Core 3.x (ESP-IDF 5.x), 16MB Flash / 8MB Octal PSRAM
+ * Features Added: Custom Token Auth, Push IDs, Corrected Firebase Paths & Payload Struct, NTP Sync
+ * RTC Module    : DS3231 
+ * =====================================================================================
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Firebase_ESP_Client.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include <time.h>
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ================= WIFI CONFIGURATION =================
+#define WIFI_SSID "FLEXI-OFFICE"
+#define WIFI_PASSWORD "Flexi@w1f1"
+
+// ================= DEVICE / FIREBASE CONFIGURATION =================
+#define DEVICE_ID              "Machine_03"
+#define DEVICE_SECRET          "long-random-secret-per-device-3"
+#define FIREBASE_API_KEY       "AIzaSyCUcJCiWqAY77Jh5MnnsjPkCizWS4F2av4"
+#define FIREBASE_DATABASE_URL  "https://esp-project-ebe94-default-rtdb.firebaseio.com"
+
+const char *mongoLogApiUrl = "https://esp32server-xrnm.onrender.com/api/logEvent";
+const char *backendTokenUrl = "https://esp32server-xrnm.onrender.com/api/getFirebaseToken";
+
+#define DEVICE_ID_MAXLEN  40
+#define FB_PATH_MAXLEN    120
+
+static char g_deviceIdBuf[DEVICE_ID_MAXLEN] = DEVICE_ID;
+static char g_basePath[FB_PATH_MAXLEN] = "";
+static char g_liveStatusPath[FB_PATH_MAXLEN] = "";
+static char g_historyPath[FB_PATH_MAXLEN] = "";
+static String g_firebaseCustomToken = "";
+
+static unsigned long g_lastTokenFetchAttemptMs = 0;
+static unsigned long g_tokenFetchBackoffMs = 2000UL;      
+static const unsigned long TOKEN_FETCH_BACKOFF_MAX_MS = 5UL * 60UL * 1000UL; 
+static volatile bool g_authInProgress = false;
+
+// ================= NTP SERVER =================
+const long gmtOffset_sec = 19800; // 5 hours 30 minutes for Sri Lanka (5.5 * 3600)
+const int daylightOffset_sec = 0;
+
+// ================= FIREBASE =================
+FirebaseData* fbdo = nullptr;       
+FirebaseData* fbdoSync = nullptr;   
+FirebaseAuth* auth = nullptr;
+FirebaseConfig* config = nullptr;
+
+// ================= LCD & RTC =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+RTC_DS3231 rtc;  // <--- DS3231 RTC Module
+
+// ================= PINS =================
+#define SENSOR_PIN 15
+#define RESET_BUTTON_PIN 16
+
+// ================= TIMING CONSTANTS =================
+#define SENSOR_COOLDOWN_MS        3500   // 50ms cooldown for faster physical taps
+#define RESET_HOLD_MS             5000
+#define NVS_SAVE_MAX_INTERVAL_MS  2000UL
+#define NVS_SAVE_COUNT_THRESHOLD  10UL
+#define WIFI_RECONNECT_BACKOFF_MS 5000UL
+
+#define GUARD_FRONT_MAGIC 0xC0FFEE01UL
+#define GUARD_BACK_MAGIC  0xC0FFEE02UL
+#define NVS_RECORD_MAGIC  0xFEEDBEEFUL
+#define CANARY_FRONT_VAL  0xDEADC0DEUL
+#define CANARY_BACK_VAL   0xC0DEDEADUL
+
+typedef struct {
+  uint32_t guardFront;
+  uint32_t count;
+  uint32_t sequence;
+  uint32_t crc32;
+  uint32_t guardBack;
+} CounterBlock;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t seq;
+  uint32_t count;
+  uint32_t crc;
+} NVSRecord;
+
+typedef struct {
+  char eventType[24];
+  char message[160];
+} LogMessage;
+
+static volatile uint32_t g_canaryFront = CANARY_FRONT_VAL;
+static CounterBlock counterBlock;
+static volatile uint32_t g_canaryBack = CANARY_BACK_VAL;
+
+#define CRASH_REPORT_MAGIC 0xACE55A11UL
+typedef struct {
+  uint32_t magic;
+  uint32_t crc;
+  uint32_t bootCount;
+  uint32_t counterValue;
+  uint32_t counterSequence;
+  uint32_t freeHeap;
+  uint32_t minFreeHeap;
+  uint32_t largestFreeBlock;
+  uint32_t uptimeMs;
+  uint32_t lastFirebaseUploadMs;
+  uint32_t lastNvsSaveMs;
+  uint32_t lastHttpLogMs;
+  uint32_t lastRtcReadMs;
+  uint32_t lastWifiConnectMs;
+  uint8_t  wifiConnected;
+  uint8_t  mutexTimeoutSeen;
+  uint8_t  queueOverflowSeen;
+  uint8_t  reserved;
+} CrashReport;
+
+RTC_NOINIT_ATTR CrashReport g_crashReport;
+
+static volatile uint32_t g_lastFirebaseUploadMs = 0;
+static volatile uint32_t g_lastNvsSaveMs = 0;
+static volatile uint32_t g_lastHttpLogMs = 0;
+static volatile uint32_t g_lastRtcReadMs = 0;
+static volatile uint32_t g_lastWifiConnectMs = 0;
+static volatile uint8_t  g_wifiConnected = 0;
+static volatile uint8_t  g_mutexTimeoutSeen = 0;
+static volatile uint8_t  g_queueOverflowSeen = 0;
+
+SemaphoreHandle_t xCounterMutex = NULL;
+QueueHandle_t xLogQueue = NULL;
+TaskHandle_t hSensorTask = NULL;
+TaskHandle_t hDisplayTask = NULL;
+TaskHandle_t hFirebaseTask = NULL;
+TaskHandle_t hBackgroundTask = NULL;
+TaskHandle_t hLogTask = NULL;
+
+static uint32_t g_bootCount = 0;
+static uint32_t g_lastSavedCount = 0;
+static unsigned long g_lastNvsSaveTimeMs = 0;
+static bool g_lcdAvailable = false;
+static bool g_rtcAvailable = false;
+
+static volatile unsigned long g_isrSensorLastTriggerMs = 0;
+static volatile bool g_isrSensorFlag = false;
+
+uint32_t calculateCRC32(const uint8_t *data, size_t length) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++) {
+      if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320UL;
+      else crc >>= 1;
+    }
+  }
+  return ~crc;
+}
+
+void updateCounterBlockCRC() {
+  counterBlock.crc32 = calculateCRC32((uint8_t*)&counterBlock.count, sizeof(counterBlock.count) + sizeof(counterBlock.sequence));
+}
+
+bool verifyCounterBlockCRC() {
+  uint32_t calc = calculateCRC32((uint8_t*)&counterBlock.count, sizeof(counterBlock.count) + sizeof(counterBlock.sequence));
+  return (calc == counterBlock.crc32);
+}
+
+void dispatchLog(const char* type, const char* msg) {
+  LogMessage packet;
+  snprintf(packet.eventType, sizeof(packet.eventType), "%s", type);
+  snprintf(packet.message, sizeof(packet.message), "%s", msg);
+  if (xLogQueue != NULL) {
+    if (xQueueSend(xLogQueue, &packet, 0) != pdPASS) {
+      g_queueOverflowSeen = 1;
+    }
+  }
+}
+
+// ================= අලුතින් යාවත්කාලීන කළ NTP Sync Function එක =================
+void syncTimeFromNTP() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // Servers 3ක් ලබා දී ඇත
+    configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.google.com", "time.windows.com");
+    
+    struct tm timeinfo;
+    bool time_synced = false;
+    
+    // අන්තර්ජාලයෙන් වේලාව ලබාගැනීමට 3 වතාවක් උත්සාහ කිරීම (එක් වරකට තත්පර 5ක් බැගින්)
+    for (int i = 0; i < 3; i++) {
+      if (getLocalTime(&timeinfo, 5000)) {
+        time_synced = true;
+        break; // සාර්ථක නම් Loop එකෙන් ඉවත් වේ
+      }
+      delay(1000); // අසාර්ථක නම් තත්පර 1ක් රැඳී සිට නැවත උත්සාහ කරයි
+    }
+    
+    if (time_synced) {
+      if (g_rtcAvailable) {
+        rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
+        dispatchLog("NTP_SYNC", "Time synchronized from NTP and RTC updated.");
+      }
+    } else {
+      dispatchLog("NTP_FAIL", "Failed to obtain time from NTP servers after multiple attempts.");
+    }
+  }
+}
+// ====================================================================
+
+void updateCrashSnapshot() {
+  g_crashReport.magic = CRASH_REPORT_MAGIC;
+  g_crashReport.bootCount = g_bootCount;
+  if (xSemaphoreTake(xCounterMutex, 0) == pdTRUE) {
+    g_crashReport.counterValue = counterBlock.count;
+    g_crashReport.counterSequence = counterBlock.sequence;
+    xSemaphoreGive(xCounterMutex);
+  }
+  g_crashReport.freeHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  g_crashReport.minFreeHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+  g_crashReport.largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  g_crashReport.uptimeMs = millis();
+  g_crashReport.lastFirebaseUploadMs = g_lastFirebaseUploadMs;
+  g_crashReport.lastNvsSaveMs = g_lastNvsSaveMs;
+  g_crashReport.lastHttpLogMs = g_lastHttpLogMs;
+  g_crashReport.lastRtcReadMs = g_lastRtcReadMs;
+  g_crashReport.lastWifiConnectMs = g_lastWifiConnectMs;
+  g_crashReport.wifiConnected = g_wifiConnected;
+  g_crashReport.mutexTimeoutSeen = g_mutexTimeoutSeen;
+  g_crashReport.queueOverflowSeen = g_queueOverflowSeen;
+  g_crashReport.crc = calculateCRC32((uint8_t*)&g_crashReport.bootCount, sizeof(CrashReport) - (2 * sizeof(uint32_t)));
+}
+
+void IRAM_ATTR sensorISR() {
+  unsigned long now = millis();
+  if (now - g_isrSensorLastTriggerMs >= SENSOR_COOLDOWN_MS) {
+    g_isrSensorFlag = true;
+    g_isrSensorLastTriggerMs = now;
+  }
+}
+
+void saveCounterBlockToNVS(uint32_t finalCount, uint32_t finalSeq) {
+  Preferences prefs;
+  if (!prefs.begin("factory_sys", false)) return;
+  NVSRecord record;
+  record.magic = NVS_RECORD_MAGIC;
+  record.count = finalCount;
+  record.seq = finalSeq;
+  record.crc = calculateCRC32((uint8_t*)&record.count, sizeof(record.count) + sizeof(record.seq));
+  prefs.putBytes("rec_copy_a", &record, sizeof(NVSRecord));
+  prefs.putBytes("rec_copy_b", &record, sizeof(NVSRecord));
+  prefs.end();
+  g_lastSavedCount = finalCount;
+  g_lastNvsSaveTimeMs = millis();
+  g_lastNvsSaveMs = (uint32_t)g_lastNvsSaveTimeMs;
+}
+
+void recoverCounterState() {
+  Preferences prefs;
+  bool validA = false, validB = false;
+  NVSRecord recA, recB;
+  if (prefs.begin("factory_sys", true)) {
+    if (prefs.getBytes("rec_copy_a", &recA, sizeof(NVSRecord)) == sizeof(NVSRecord)) {
+      if (recA.magic == NVS_RECORD_MAGIC && recA.crc == calculateCRC32((uint8_t*)&recA.count, sizeof(recA.count) + sizeof(recA.seq))) validA = true;
+    }
+    if (prefs.getBytes("rec_copy_b", &recB, sizeof(NVSRecord)) == sizeof(NVSRecord)) {
+      if (recB.magic == NVS_RECORD_MAGIC && recB.crc == calculateCRC32((uint8_t*)&recB.count, sizeof(recB.count) + sizeof(recB.seq))) validB = true;
+    }
+    g_bootCount = prefs.getUInt("boot_count", 0) + 1;
+    prefs.end();
+  } else {
+    g_bootCount = 1;
+  }
+
+  if (prefs.begin("factory_sys", false)) {
+    prefs.putUInt("boot_count", g_bootCount);
+    prefs.end();
+  }
+
+  counterBlock.guardFront = GUARD_FRONT_MAGIC;
+  counterBlock.guardBack = GUARD_BACK_MAGIC;
+
+  if (validA && validB) {
+    if (recA.seq >= recB.seq) { counterBlock.count = recA.count; counterBlock.sequence = recA.seq; } 
+    else { counterBlock.count = recB.count; counterBlock.sequence = recB.seq; }
+  } else if (validA) {
+    counterBlock.count = recA.count; counterBlock.sequence = recA.seq;
+  } else if (validB) {
+    counterBlock.count = recB.count; counterBlock.sequence = recB.seq;
+  } else {
+    counterBlock.count = 0; counterBlock.sequence = 0;
+  }
+  updateCounterBlockCRC();
+  g_lastSavedCount = counterBlock.count;
+}
+
+void enqueueOfflinePayload(uint32_t val, uint32_t seq, const char* timeStr, uint32_t unixTime) {
+  if (!LittleFS.exists("/queue")) LittleFS.mkdir("/queue");
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/queue/%u.json", seq);
+  File f = LittleFS.open(filename, FILE_WRITE);
+  if (f) {
+    JsonDocument doc;
+    doc["Count"] = val; 
+    doc["sequence"] = seq; 
+    doc["Time"] = timeStr; 
+    doc["timestamp"] = unixTime;
+    serializeJson(doc, f);
+    f.close();
+  }
+}
+
+bool executeCustomTokenTransaction() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, backendTokenUrl)) return false;
+  
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("User-Agent", "ESP32-S3-Hardened/11.0");
+  http.addHeader("X-Device-ID", g_deviceIdBuf);
+  http.addHeader("Authorization", String("Bearer ") + DEVICE_SECRET);
+
+  JsonDocument outDoc;
+  outDoc["deviceId"] = g_deviceIdBuf;
+  outDoc["secret"] = DEVICE_SECRET;
+  
+  String reqPayload;
+  serializeJson(outDoc, reqPayload);
+  int code = http.POST(reqPayload);
+  bool success = false;
+  
+  if (code == HTTP_CODE_OK) {
+    String resp = http.getString();
+    JsonDocument inDoc;
+    DeserializationError err = deserializeJson(inDoc, resp);
+    if (!err && inDoc.containsKey("token")) {
+      g_firebaseCustomToken = inDoc["token"].as<String>();
+      Firebase.setCustomToken(config, g_firebaseCustomToken.c_str());
+      success = true;
+    }
+  }
+  http.end();
+  return success;
+}
+
+void syncOfflineData() {
+  if (!LittleFS.exists("/queue")) return;
+  File root = LittleFS.open("/queue");
+  if (!root || !root.isDirectory()) return;
+  
+  File f = root.openNextFile();
+  while (f) {
+    if (!g_wifiConnected || !Firebase.ready()) { f.close(); break; }
+    
+    String path = f.path();
+    if (!f.isDirectory() && path.endsWith(".json")) {
+      String payload = f.readString();
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, payload);
+      if (!err) {
+        FirebaseJson syncJson;
+        syncJson.set("Count", doc["Count"].as<uint32_t>());
+        syncJson.set("Time", doc["Time"].as<const char*>());
+        syncJson.set("timestamp", doc["timestamp"].as<uint32_t>());
+        
+        // ඔෆ්ලයින් දත්ත ද push() හරහා යැවීම
+        if (Firebase.RTDB.push(fbdoSync, g_historyPath, &syncJson)) {
+          f.close(); LittleFS.remove(path); root = LittleFS.open("/queue"); f = root.openNextFile(); continue;
+        }
+      }
+    }
+    f.close(); f = root.openNextFile();
+  }
+}
+
+void vSensorTask(void *pvParameters) {
+  unsigned long buttonHoldStartMs = 0;
+  bool buttonActive = false;
+  for (;;) {
+    if (g_isrSensorFlag) {
+      g_isrSensorFlag = false;
+      if (xSemaphoreTake(xCounterMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (verifyCounterBlockCRC()) {
+          counterBlock.count++; counterBlock.sequence++; updateCounterBlockCRC();
+          dispatchLog("SENSOR_TRIGGER", "Counter advanced atomically via interrupt edge.");
+        } else {
+          dispatchLog("CRITICAL_CRC", "Memory integrity failure caught on process step.");
+        }
+        xSemaphoreGive(xCounterMutex);
+      } else g_mutexTimeoutSeen = 1;
+    }
+    
+    if (digitalRead(RESET_BUTTON_PIN) == HIGH) { 
+      if (!buttonActive) { buttonActive = true; buttonHoldStartMs = millis(); } 
+      else if (millis() - buttonHoldStartMs >= RESET_HOLD_MS) {
+        if (xSemaphoreTake(xCounterMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+          counterBlock.count = 0; counterBlock.sequence++; updateCounterBlockCRC();
+          saveCounterBlockToNVS(0, counterBlock.sequence);
+          xSemaphoreGive(xCounterMutex);
+          dispatchLog("RESET_EVENT", "Counter wiped back to zero by manual physical button hold.");
+        }
+        buttonActive = false; 
+        while(digitalRead(RESET_BUTTON_PIN) == HIGH) { vTaskDelay(pdMS_TO_TICKS(50)); } 
+      }
+    } else buttonActive = false;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void vDisplayTask(void *pvParameters) {
+  uint32_t currentDisplayCount = 0;
+  char line0[17]; char line1[17];
+  for (;;) {
+    if (xSemaphoreTake(xCounterMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      currentDisplayCount = counterBlock.count;
+      xSemaphoreGive(xCounterMutex);
+    }
+    char timeString[9] = "00:00:00";
+    if (g_rtcAvailable) {
+      DateTime now = rtc.now();
+      g_lastRtcReadMs = millis();
+      snprintf(timeString, sizeof(timeString), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    }
+    if (g_lcdAvailable) {
+      snprintf(line0, sizeof(line0), "COUNT: %-9u", currentDisplayCount);
+      snprintf(line1, sizeof(line1), "SYS:%s %c", timeString, g_wifiConnected ? 'W' : ' ');
+      lcd.setCursor(0, 0); lcd.print(line0);
+      lcd.setCursor(0, 1); lcd.print(line1);
+    }
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+}
+
+void vFirebaseTask(void *pvParameters) {
+  uint32_t lastProcessedSeq = 0;
+  
+  // බෝඩ් එක On වූ පසු පළමු වරට Wi-Fi ලැබුණු වහාම ටෝකන් එක ලබා ගැනීමට උත්සාහ කිරීම
+  while (g_wifiConnected && g_firebaseCustomToken == "") {
+    dispatchLog("AUTH_ATTEMPT", "Fetching initial Firebase custom token...");
+    if (executeCustomTokenTransaction()) {
+      dispatchLog("AUTH_SUCCESS", "Initial Firebase custom token acquired successfully.");
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(3000)); // අසාර්ථක වුවහොත් තත්පර 3 කින් නැවත උත්සාහ කරයි
+  }
+
+  for (;;) {
+    if (g_wifiConnected && Firebase.ready()) {
+      
+      // අලුතින් එක් කරන ලද ස්ථානය: ඔෆ්ලයින් දත්ත යැවීම මෙහිදී සිදුවේ.
+      syncOfflineData();
+      
+      uint32_t workingCount = 0; uint32_t workingSeq = 0; bool targetAcquired = false;
+      if (xSemaphoreTake(xCounterMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (counterBlock.sequence != lastProcessedSeq) {
+          workingCount = counterBlock.count; workingSeq = counterBlock.sequence; targetAcquired = true;
+        }
+        xSemaphoreGive(xCounterMutex);
+      }
+      
+      if (targetAcquired) {
+        char timeFormatted[32] = "2026/01/01 00:00:00";
+        uint32_t currentTimestamp = 0;
+        
+        if (g_rtcAvailable) {
+          DateTime now = rtc.now();
+          snprintf(timeFormatted, sizeof(timeFormatted), "%04d/%02d/%02d %02d:%02d:%02d", 
+                   now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+          currentTimestamp = now.unixtime();
+        }
+        
+        // අලුත් ආකෘතියට අනුව JSON සකස් කිරීම
+        FirebaseJson payloadJson;
+        payloadJson.set("Count", workingCount); 
+        payloadJson.set("Time", timeFormatted); 
+        payloadJson.set("timestamp", currentTimestamp);
+        
+        // LiveStatus එක Update කිරීම
+        if (Firebase.RTDB.setJSON(fbdo, g_liveStatusPath, &payloadJson)) {
+          g_lastFirebaseUploadMs = millis();
+          lastProcessedSeq = workingSeq;
+          
+          // CounterHistory සඳහා push() මඟින් අද්විතීය ID එකක් යටතේ සටහන් කිරීම
+          Firebase.RTDB.push(fbdo, g_historyPath, &payloadJson);
+        } else {
+          enqueueOfflinePayload(workingCount, workingSeq, timeFormatted, currentTimestamp);
+          lastProcessedSeq = workingSeq;
+        }
+      }
+    } else if (g_wifiConnected && !g_authInProgress) {
+      unsigned long currentMs = millis();
+      if (currentMs - g_lastTokenFetchAttemptMs >= g_tokenFetchBackoffMs) {
+        g_authInProgress = true;
+        g_lastTokenFetchAttemptMs = currentMs;
+        unsigned long nextBackoff = (g_tokenFetchBackoffMs * 2);
+        
+        if (executeCustomTokenTransaction()) {
+          g_tokenFetchBackoffMs = 2000UL; 
+          dispatchLog("AUTH_REFRESH", "Firebase custom token refreshed successfully.");
+        } else {
+          g_tokenFetchBackoffMs = (nextBackoff < TOKEN_FETCH_BACKOFF_MAX_MS) ? nextBackoff : TOKEN_FETCH_BACKOFF_MAX_MS;
+        }
+        g_authInProgress = false;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void vBackgroundTask(void *pvParameters) {
+  unsigned long lastWifiCheckMs = 0;
+  for (;;) {
+    unsigned long now = millis();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!g_wifiConnected) {
+        g_wifiConnected = 1; g_lastWifiConnectMs = now;
+        dispatchLog("NET_CONNECT", "WiFi path connection successfully unified.");
+        
+        // Wi-Fi Reconnect වූ විටද වේලාව යාවත්කාලීන කර ගැනීම සඳහා
+        syncTimeFromNTP(); 
+      }
+    } else {
+      g_wifiConnected = 0;
+      if (now - lastWifiCheckMs >= WIFI_RECONNECT_BACKOFF_MS) {
+        lastWifiCheckMs = now; WiFi.disconnect(); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      }
+    }
+    
+    // ඉවත් කරන ලද ස්ථානය: syncOfflineData() මෙතැනින් ඉවත් කර ඇත.
+    
+    uint32_t cVal = 0, cSeq = 0;
+    if (xSemaphoreTake(xCounterMutex, pdMS_TO_TICKS(50)) == pdTRUE) { cVal = counterBlock.count; cSeq = counterBlock.sequence; xSemaphoreGive(xCounterMutex); }
+    
+    uint32_t diff = (cVal >= g_lastSavedCount) ? (cVal - g_lastSavedCount) : cVal;
+    if (diff >= NVS_SAVE_COUNT_THRESHOLD || (now - g_lastNvsSaveTimeMs >= NVS_SAVE_MAX_INTERVAL_MS && cVal != g_lastSavedCount)) {
+      saveCounterBlockToNVS(cVal, cSeq);
+    }
+    
+    if (g_canaryFront != CANARY_FRONT_VAL || g_canaryBack != CANARY_BACK_VAL) {
+      saveCounterBlockToNVS(cVal, cSeq); esp_restart(); 
+    }
+    updateCrashSnapshot();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void vLogTask(void *pvParameters) {
+  LogMessage outgoingPacket;
+  WiFiClientSecure client; client.setInsecure();
+  
+  for (;;) {
+    if (xQueueReceive(xLogQueue, &outgoingPacket, pdMS_TO_TICKS(500)) == pdTRUE) {
+      Serial.printf("[%s] %s\n", outgoingPacket.eventType, outgoingPacket.message);
+      if (g_wifiConnected) {
+        HTTPClient http;
+        if (http.begin(client, mongoLogApiUrl)) {
+          http.addHeader("Content-Type", "application/json");
+          http.addHeader("User-Agent", "ESP32-S3-Hardened/11.0");
+          http.addHeader("X-Device-ID", g_deviceIdBuf);
+          http.addHeader("Authorization", String("Bearer ") + DEVICE_SECRET);
+
+          JsonDocument outDoc;
+          outDoc["deviceId"] = g_deviceIdBuf; outDoc["eventType"] = outgoingPacket.eventType;
+          outDoc["message"] = outgoingPacket.message; outDoc["timestamp"] = millis();
+          
+          String body; serializeJson(outDoc, body);
+          int code = http.POST(body);
+          if (code == HTTP_CODE_OK || code == HTTP_CODE_CREATED) g_lastHttpLogMs = millis();
+          http.end();
+        }
+      }
+    }
+  }
+}
+
+// ================= COLD START SYSTEM INITIALIZER (STAGGERED BOOT) =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000); 
+  
+  Serial.println("\n--- SYSTEM BOOTING ---");
+
+  Serial.print("Connecting to Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Connected!");
+  Serial.println(WiFi.localIP());
+  
+  delay(500); 
+  Wire.begin(8, 9);
+  lcd.init(); lcd.backlight(); lcd.clear(); g_lcdAvailable = true;
+  
+  delay(200);
+  if (rtc.begin()) g_rtcAvailable = true;
+  
+  delay(200);
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS Mounting Failure. Please check Partition Scheme.");
+  } else {
+    Serial.println("LittleFS Mounted Successfully.");
+  }
+  
+  delay(200);
+  fbdo = new FirebaseData();
+  fbdoSync = new FirebaseData();
+  auth = new FirebaseAuth();
+  config = new FirebaseConfig();
+  
+  xCounterMutex = xSemaphoreCreateMutex();
+  xLogQueue = xQueueCreate(30, sizeof(LogMessage));
+  
+  recoverCounterState();
+
+  // Wi-Fi සම්පූර්ණයෙන්ම ස්ථාපිත වීමට තත්පර 2ක් ලබා දීම
+  delay(2000); 
+
+  // ---> අලුතින් එක් කළ NTP Time Sync කිරීම <---
+  syncTimeFromNTP();
+
+  // ---> අලුත් Firebase Paths (Machines යටතට මාරු කර ඇත) <---
+  snprintf(g_basePath, sizeof(g_basePath), "/Machines/%s", g_deviceIdBuf);
+  snprintf(g_liveStatusPath, sizeof(g_liveStatusPath), "%s/LiveStatus", g_basePath);
+  snprintf(g_historyPath, sizeof(g_historyPath), "%s/CounterHistory", g_basePath);
+  
+  config->api_key = FIREBASE_API_KEY;
+  config->database_url = FIREBASE_DATABASE_URL;
+  Firebase.begin(config, auth);
+  Firebase.reconnectWiFi(false);
+  
+  delay(200);
+  pinMode(SENSOR_PIN, INPUT_PULLUP);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLDOWN); // Active-HIGH
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, FALLING);
+  
+  // ---> අලුතින් වෙනස් කරන ලද Stack ප්‍රමාණයන් <---
+  xTaskCreatePinnedToCore(vSensorTask,     "SensorTsk",  4096,  NULL, 4, &hSensorTask,     0);
+  xTaskCreatePinnedToCore(vDisplayTask,    "DispTsk",    4096,  NULL, 1, &hDisplayTask,    0);
+  xTaskCreatePinnedToCore(vFirebaseTask,   "FBTask",     10240, NULL, 2, &hFirebaseTask,   1); // Stack size වැඩි කර ඇත
+  xTaskCreatePinnedToCore(vBackgroundTask, "BgTask",     8192,  NULL, 2, &hBackgroundTask, 1); // Stack size වැඩි කර ඇත
+  xTaskCreatePinnedToCore(vLogTask,        "LogTask",    8192,  NULL, 1, &hLogTask,        1);
+  
+  dispatchLog("BOOT_SEQUENCE", "System initialized successfully via staggered boot.");
+  Serial.println("--- SYSTEM FULLY STARTED ---");
+}
+
+void loop() {
+  vTaskDelete(NULL);
+}
