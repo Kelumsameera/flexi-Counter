@@ -10,8 +10,7 @@
 #include "time.h" 
 
 // ================= WIFI =================
-#define WIFI_SSID "FLEXI-OFFICE"
-#define WIFI_PASSWORD "Flexi@w1f1"
+#include "secrets.h"  // Local Wi-Fi credentials; copy secrets.example.h to secrets.h
 
 // ================= STATIC IP =================
 IPAddress local_IP(192, 168, 0, 213);   
