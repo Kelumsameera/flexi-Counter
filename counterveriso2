@@ -25,13 +25,12 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ================= WIFI CONFIGURATION =================
-#define WIFI_SSID "FLEXI-OFFICE"
-#define WIFI_PASSWORD "Flexi@w1f1"
+#include "secrets.h"  // Local credentials/configuration
 
 // ================= DEVICE / FIREBASE CONFIGURATION =================
 #define DEVICE_ID              "Machine_03"
-#define DEVICE_SECRET          "long-random-secret-per-device-3"
-#define FIREBASE_API_KEY       "AIzaSyCUcJCiWqAY77Jh5MnnsjPkCizWS4F2av4"
+
+
 #define FIREBASE_DATABASE_URL  "https://esp-project-ebe94-default-rtdb.firebaseio.com"
 
 const char *mongoLogApiUrl = "https://esp32server-xrnm.onrender.com/api/logEvent";
