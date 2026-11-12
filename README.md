@@ -17,7 +17,7 @@ ESP32-based production counting and reporting experiments for factory equipment.
 4. Install the Arduino/ESP32 board core and dependencies matching the source includes.
 5. Compile locally and test reset/count behavior, Firebase connectivity, time sync and recovery from Wi-Fi outages before deployment to a production machine.
 
-The earlier `counterok.ino` uses the `secrets.h` file for Wi-Fi. A separate draft PR proposes using the same local configuration for credentials in `counterveriso2`.
+Both `counterok.ino` and `counterveriso2` now refer to the ignored local `secrets.h` for credentials. Supply the definitions from `secrets.example.h` and verify the Arduino build before flashing; merging the source does not update deployed devices.
 
 ## Security notice
 
