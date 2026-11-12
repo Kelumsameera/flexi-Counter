@@ -1,0 +1,8 @@
+# Device credentials (create locally from secrets.example.h)
+secrets.h
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.map
